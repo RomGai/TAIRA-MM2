@@ -18,13 +18,15 @@ try:
 except Exception:  # pragma: no cover
     torch = None
 
-try:
-    from scripts.qwen3_vl_embedding import Qwen3VLEmbedder
-except ModuleNotFoundError:
-    try:
-        from qwen3_vl_embedding import Qwen3VLEmbedder
-    except ModuleNotFoundError:
-        Qwen3VLEmbedder = None
+from qwen3_vl_embedding import Qwen3VLEmbedder
+
+# try:
+#     from scripts.qwen3_vl_embedding import Qwen3VLEmbedder
+# except ModuleNotFoundError:
+#     try:
+#         from qwen3_vl_embedding import Qwen3VLEmbedder
+#     except ModuleNotFoundError:
+#         Qwen3VLEmbedder = None
 
 try:
     from dynamic_reasoning_ranking_agent import run_module3
