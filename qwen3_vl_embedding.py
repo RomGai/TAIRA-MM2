@@ -285,8 +285,21 @@ class Qwen3VLEmbedder():
             images = None
             video_inputs = None
             video_kwargs = {'do_sample_frames': False}
+            text_only_conversations: List[List[Dict[str, Any]]] = []
+            for conv in conversations:
+                cleaned_conv: List[Dict[str, Any]] = []
+                for turn in conv:
+                    role = turn.get("role", "user")
+                    content = turn.get("content", [])
+                    if not isinstance(content, list):
+                        content = []
+                    text_parts = [c for c in content if isinstance(c, dict) and c.get("type") == "text"]
+                    if not text_parts:
+                        text_parts = [{"type": "text", "text": "NULL"}]
+                    cleaned_conv.append({"role": role, "content": text_parts})
+                text_only_conversations.append(cleaned_conv)
             text = self.processor.apply_chat_template(
-                [{'role': 'user', 'content': [{'type': 'text', 'text': 'NULL'}]}], 
+                text_only_conversations,
                 add_generation_prompt=True, tokenize=False
             )
 

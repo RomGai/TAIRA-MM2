@@ -203,7 +203,7 @@ def _encode_multimodal_inputs(vl_embedder: Any, inputs: List[Dict[str, Any]], ba
         batch_inputs = inputs[start:end]
         try:
             emb = vl_embedder.process(batch_inputs)
-            all_chunks.append(emb.detach().cpu().numpy().astype(np.float32, copy=False))
+            all_chunks.append(emb.detach().to(torch.float32).cpu().numpy())
             start = end
             _cleanup_torch_cache()
         except RuntimeError as exc:
@@ -746,7 +746,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
 
         if args.enable_multimodal_embedding:
-            q_emb = vl_embedder.process([{"text": q_sentence}]).detach().cpu().numpy().astype(np.float32, copy=False)
+            q_emb = vl_embedder.process([{"text": q_sentence}]).detach().to(torch.float32).cpu().numpy()
         else:
             q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
@@ -910,7 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vl-embedding-model", default="Qwen/Qwen3-VL-Embedding-2B")
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
-    parser.add_argument("--embed-save-every", type=int, default=20000)
+    parser.add_argument("--embed-save-every", type=int, default=1000)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
     parser.add_argument("--agent3-history-embedding-topk", type=int, default=20, help="Agent3额外从用户历史中按query向量相似度召回Top-K（不足则全召回）。")
