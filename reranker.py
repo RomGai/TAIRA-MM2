@@ -120,6 +120,7 @@ class LLMItemReranker:
         }
 
         next_predictions = preference_constraints.get("Predicted_Next_Items", [])
+        collaborative_signals = preference_constraints.get("Similar_User_Collaborative_Signals", {})
 
         return (
             "你是电商推荐精排专家（Agent5）。请从用户视角判断候选商品与当下偏好的匹配程度。\n"
@@ -136,6 +137,7 @@ class LLMItemReranker:
             f"Nice_to_Have: {json.dumps(nice_to_have, ensure_ascii=False)}\n"
             f"Must_Avoid: {json.dumps(must_avoid, ensure_ascii=False)}\n"
             f"Predicted_Next_Items: {json.dumps(next_predictions, ensure_ascii=False)}\n"
+            f"Collaborative_Signals_From_Similar_Users: {json.dumps(collaborative_signals, ensure_ascii=False)}\n"
             f"候选商品画像: {json.dumps(compact_item, ensure_ascii=False)}\n"
         )
 

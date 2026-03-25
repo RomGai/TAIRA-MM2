@@ -340,6 +340,10 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
             disable_prediction_bonus=bool(getattr(args, "disable_prediction_bonus", False)),
             save_output=True,
             output_dir=args.dynamic_output_dir,
+            collaborative_db_path=args.collaborative_db_path,
+            collaborative_embedding_model=args.collaborative_embedding_model,
+            collaborative_similarity_threshold=args.collaborative_similarity_threshold,
+            collaborative_top_k=args.collaborative_top_k,
         )
 
     bundle_file = _bundle_paths(
@@ -410,6 +414,10 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable Agent5 prediction bonus and use logits-weighted score only.",
     )
+    parser.add_argument("--collaborative-db-path", default="./processed/collaborative_preference_memory.db")
+    parser.add_argument("--collaborative-embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--collaborative-similarity-threshold", type=float, default=0.5)
+    parser.add_argument("--collaborative-top-k", type=int, default=5)
     return parser
 
 
