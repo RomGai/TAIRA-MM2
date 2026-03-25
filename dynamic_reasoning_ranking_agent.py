@@ -10,9 +10,14 @@ LLM backbone: Qwen3-8B (text-only), following the same invocation style as Agent
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 from reranker import LLMItemReranker
 
@@ -32,15 +37,19 @@ class PreferenceConstraints:
     must_avoid: List[str]
     next_item_predictions: List[Dict[str, str]]
     reasoning: str
+    collaborative_info: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "Must_Have": self.must_have,
             "Nice_to_Have": self.nice_to_have,
             "Must_Avoid": self.must_avoid,
             "Predicted_Next_Items": self.next_item_predictions,
             "Reasoning": self.reasoning,
         }
+        if self.collaborative_info:
+            payload.update(self.collaborative_info)
+        return payload
 
 
 @dataclass
@@ -302,6 +311,115 @@ class Qwen3DynamicReasonerLLM:
             reasoning=str(payload.get("Reasoning", f"LLM raw output: {content[:800]}")),
         )
 
+    def summarize_collaborative_preferences(
+        self,
+        query: str,
+        current_reasoning: str,
+        similar_user_reasonings: List[Dict[str, Any]],
+    ) -> str:
+        if not similar_user_reasonings:
+            return ""
+        self.load()
+        neighbor_payload = [
+            {
+                "user_id": str(x.get("user_id", "")),
+                "similarity": float(x.get("similarity", 0.0)),
+                "reasoning": str(x.get("reasoning", "")),
+            }
+            for x in similar_user_reasonings
+        ]
+        prompt = (
+            "你是推荐系统协同偏好总结器。请根据当前用户偏好推理和相似用户偏好推理，"
+            "总结可迁移的共同偏好，并给出一句可供精排使用的协同信号。\n"
+            "输出严格 JSON：{\"shared_preference_summary\":\"...\"}。\n\n"
+            f"当前用户query: {query}\n"
+            f"当前用户reasoning: {current_reasoning}\n"
+            f"相似用户reasonings(JSON): {json.dumps(neighbor_payload, ensure_ascii=False)}"
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        generated_ids = self._model.generate(**model_inputs, max_new_tokens=512)
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]) :].tolist()
+        content = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        payload = self._try_json_decode(content) or {}
+        summary = str(payload.get("shared_preference_summary", "")).strip()
+        if summary:
+            return summary
+        return f"与当前用户偏好相近的用户通常还会关注：{'; '.join([x.get('reasoning', '')[:60] for x in neighbor_payload[:3]])}"
+
+
+class CollaborativePreferenceMemory:
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS preference_memory (
+                    user_id TEXT PRIMARY KEY,
+                    reasoning TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom <= 1e-12:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    def upsert(self, user_id: str, reasoning: str, embedding: np.ndarray) -> None:
+        emb_text = json.dumps([float(x) for x in embedding.tolist()], ensure_ascii=False)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO preference_memory(user_id, reasoning, embedding, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    reasoning=excluded.reasoning,
+                    embedding=excluded.embedding,
+                    updated_at=excluded.updated_at
+                """,
+                (str(user_id), str(reasoning), emb_text, int(time.time())),
+            )
+            conn.commit()
+
+    def search_similar(self, user_id: str, query_embedding: np.ndarray, similarity_threshold: float, top_k: int) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT user_id, reasoning, embedding FROM preference_memory WHERE user_id != ?", (str(user_id),))
+            for uid, reasoning, emb_text in cur.fetchall():
+                try:
+                    emb = np.array(json.loads(emb_text), dtype=np.float32)
+                except Exception:
+                    continue
+                sim = self._cosine(query_embedding, emb)
+                if sim >= float(similarity_threshold):
+                    rows.append({"user_id": str(uid), "reasoning": str(reasoning), "similarity": sim})
+        rows.sort(key=lambda x: float(x["similarity"]), reverse=True)
+        return rows[: max(1, int(top_k))]
+
+
+def _reasoning_text_for_embedding(query: str, constraints: PreferenceConstraints) -> str:
+    return (
+        f"query: {query}\n"
+        f"must_have: {json.dumps(constraints.must_have, ensure_ascii=False)}\n"
+        f"nice_to_have: {json.dumps(constraints.nice_to_have, ensure_ascii=False)}\n"
+        f"must_avoid: {json.dumps(constraints.must_avoid, ensure_ascii=False)}\n"
+        f"reasoning: {constraints.reasoning}"
+    )
+
 
 class DynamicPreferenceReasonerAgent:
     """Agent 4: infer structured dynamic constraints from recalled history."""
@@ -346,6 +464,10 @@ def run_module3(
     save_output: bool = True,
     output_dir: str | Path = "./processed/dynamic_reasoning_ranking_outputs",
     groundtruth_target_item_id: str = "",
+    collaborative_db_path: str | Path = "./processed/collaborative_preference_memory.db",
+    collaborative_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B",
+    collaborative_similarity_threshold: float = 0.5,
+    collaborative_top_k: int = 5,
 ) -> Module3Output:
     """One-shot pipeline from Agent-3 output to module-3 final ranking."""
 
@@ -363,6 +485,36 @@ def run_module3(
         query_relevant_history=history_rows,
         candidate_type_tags=candidate_type_tags,
     )
+    collaborative_memory = CollaborativePreferenceMemory(collaborative_db_path)
+    collaborative_embedder = SentenceTransformer(collaborative_embedding_model)
+    current_reasoning_text = _reasoning_text_for_embedding(query=query, constraints=constraints)
+    current_embedding = collaborative_embedder.encode(
+        [current_reasoning_text],
+        batch_size=1,
+        prompt_name="query",
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )[0].astype(np.float32, copy=False)
+    similar_users = collaborative_memory.search_similar(
+        user_id=user_id,
+        query_embedding=current_embedding,
+        similarity_threshold=collaborative_similarity_threshold,
+        top_k=collaborative_top_k,
+    )
+    collaborative_summary = reasoner.llm.summarize_collaborative_preferences(
+        query=query,
+        current_reasoning=constraints.reasoning,
+        similar_user_reasonings=similar_users,
+    ) if similar_users else ""
+    constraints.collaborative_info = {
+        "Similar_User_Collaborative_Signals": {
+            "similarity_threshold": float(collaborative_similarity_threshold),
+            "similar_users": similar_users,
+            "shared_preference_summary": collaborative_summary,
+        }
+    }
+    collaborative_memory.upsert(user_id=user_id, reasoning=current_reasoning_text, embedding=current_embedding)
+
     if disable_must_avoid:
         constraints.must_avoid = []
     if disable_must_have:
@@ -404,6 +556,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--output-dir", default="./processed/dynamic_reasoning_ranking_outputs")
+    parser.add_argument("--collaborative-db-path", default="./processed/collaborative_preference_memory.db")
+    parser.add_argument("--collaborative-embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--collaborative-similarity-threshold", type=float, default=0.5)
+    parser.add_argument("--collaborative-top-k", type=int, default=5)
     parser.add_argument("--disable-must-have", action="store_true")
     parser.add_argument("--disable-prediction-bonus", action="store_true")
     args = parser.parse_args()
@@ -415,6 +571,10 @@ if __name__ == "__main__":
         top_n=args.top_n,
         output_dir=args.output_dir,
         save_output=True,
+        collaborative_db_path=args.collaborative_db_path,
+        collaborative_embedding_model=args.collaborative_embedding_model,
+        collaborative_similarity_threshold=args.collaborative_similarity_threshold,
+        collaborative_top_k=args.collaborative_top_k,
         disable_must_have=bool(args.disable_must_have),
         disable_prediction_bonus=bool(args.disable_prediction_bonus),
     )
