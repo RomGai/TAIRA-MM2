@@ -833,6 +833,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 save_output=True,
                 output_dir=args.output_dir,
                 groundtruth_target_item_id=target_id,
+                collaborative_db_path=args.collaborative_db_path,
+                collaborative_embedding_model=args.collaborative_embedding_model,
+                collaborative_similarity_threshold=args.collaborative_similarity_threshold,
+                collaborative_top_k=args.collaborative_top_k,
             )
             ranked_first = module3_out.ranked_items[0]["item_id"] if module3_out.ranked_items else ""
         else:
@@ -890,6 +894,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-llm-routing", action="store_true", help="开启Qwen3文本路由；默认关闭走规则fallback")
     parser.add_argument("--enable-vl-profiling", action="store_true", help="开启Qwen3-VL画像；默认关闭走轻量画像")
     parser.add_argument("--disable-agent45", action="store_true", help="关闭Agent4/5")
+    parser.add_argument("--collaborative-db-path", default="processed/collaborative_preference_memory.db")
+    parser.add_argument("--collaborative-embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--collaborative-similarity-threshold", type=float, default=0.5)
+    parser.add_argument("--collaborative-top-k", type=int, default=5)
     return parser
 
 
