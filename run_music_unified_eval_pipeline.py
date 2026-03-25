@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
+from image_prefetch import prefetch_item_images
+
 try:
     import torch
 except Exception:  # pragma: no cover
@@ -268,6 +270,7 @@ def _build_item_embedding_cache(
     embed_batch_size: int,
     chunk_size: int,
     save_every_n: int,
+    local_image_map: Dict[str, str] | None = None,
 ) -> np.ndarray:
     total = len(all_item_ids)
     print(f"[Agent3] rebuilding item embedding cache for {total} items")
@@ -297,6 +300,8 @@ def _build_item_embedding_cache(
             for idx, iid in enumerate(all_item_ids[start:end]):
                 item_input = {"text": chunk_sentences[idx]}
                 image = _resolve_item_image(meta_map[iid])
+                if local_image_map and image in local_image_map:
+                    image = local_image_map[image]
                 if image:
                     item_input["image"] = image
                 chunk_inputs.append(item_input)
@@ -642,10 +647,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     emb_model: SentenceTransformer | None = None
     vl_embedder: Any | None = None
+    local_image_map: Dict[str, str] | None = None
     if args.enable_multimodal_embedding:
         if Qwen3VLEmbedder is None:
             raise ImportError("Qwen3VLEmbedder not found. Please ensure qwen3_vl_embedding.py is importable.")
         print(f"[Init] load multimodal embedding model: {args.vl_embedding_model}")
+        if args.prefetch_images:
+            local_image_map = prefetch_item_images(
+                meta_map=meta_map,
+                resolve_image_fn=_resolve_item_image,
+                cache_dir=Path(args.image_cache_dir),
+                max_workers=max(1, int(args.image_prefetch_workers)),
+                timeout_sec=max(1, int(args.image_download_timeout_sec)),
+            )
         vl_embedder = Qwen3VLEmbedder(model_name_or_path=args.vl_embedding_model)
         emb_cache_path = cache_dir / "agent3_item_embedding_cache_vl.npz"
     else:
@@ -671,6 +685,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             embed_batch_size=args.embed_batch_size,
             chunk_size=args.embed_chunk_size,
             save_every_n=args.embed_save_every,
+            local_image_map=local_image_map,
         )
 
     item_emb_norm = _l2_normalize(item_emb_matrix)
@@ -914,6 +929,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=1000)
+    parser.add_argument("--prefetch-images", action="store_true", help="先集中下载图片到本地缓存，再从本地路径做多模态embedding。")
+    parser.add_argument("--image-cache-dir", default="processed/image_cache/music")
+    parser.add_argument("--image-prefetch-workers", type=int, default=16)
+    parser.add_argument("--image-download-timeout-sec", type=int, default=8)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
     parser.add_argument("--agent3-history-embedding-topk", type=int, default=20, help="Agent3额外从用户历史中按query向量相似度召回Top-K（不足则全召回）。")
