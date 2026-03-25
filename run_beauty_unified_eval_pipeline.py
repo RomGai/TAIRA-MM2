@@ -18,6 +18,7 @@ try:
 except Exception:  # pragma: no cover
     torch = None
 
+from image_prefetch import prefetch_item_images
 from qwen3_vl_embedding import Qwen3VLEmbedder
 
 # try:
@@ -194,7 +195,7 @@ def _encode_multimodal_inputs(
         end = min(len(inputs), start + batch_size)
         batch_inputs = inputs[start:end]
         emb = vl_embedder.process(batch_inputs)
-        all_chunks.append(emb.detach().cpu().numpy().astype(np.float32, copy=False))
+        all_chunks.append(emb.detach().to(torch.float32).cpu().numpy())
         _cleanup_torch_cache()
     return np.concatenate(all_chunks, axis=0) if all_chunks else np.zeros((0, 0), dtype=np.float32)
 
@@ -210,11 +211,18 @@ def _build_item_embedding_cache(
     embed_batch_size: int,
     chunk_size: int,
     save_every_n: int,
+    local_image_map: Dict[str, str] | None = None,
 ) -> np.ndarray:
     total = len(all_item_ids)
     print(f"[Agent3] rebuilding item embedding cache for {total} items")
     all_emb_chunks: List[np.ndarray] = []
+    shard_paths: List[Path] = []
     processed = 0
+    shard_idx = 0
+    emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for old_shard in emb_cache_path.parent.glob(f"{emb_cache_path.stem}.part_*.npy"):
+        old_shard.unlink()
 
     for start in range(0, total, chunk_size):
         end = min(total, start + chunk_size)
@@ -232,6 +240,8 @@ def _build_item_embedding_cache(
                 for idx, iid in enumerate(all_item_ids[start:end]):
                     item_input = {"text": chunk_sentences[idx]}
                     image = _resolve_item_image(meta_map[iid])
+                    if local_image_map and image in local_image_map:
+                        image = local_image_map[image]
                     if image:
                         item_input["image"] = image
                     chunk_inputs.append(item_input)
@@ -255,14 +265,29 @@ def _build_item_embedding_cache(
 
         if processed % save_every_n == 0 or processed == total:
             partial = np.concatenate(all_emb_chunks, axis=0)
-            emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids[:processed]), item_embeddings=partial)
-            print(f"[Agent3][cache save] {processed}/{total} -> {emb_cache_path}")
+            shard_path = emb_cache_path.parent / f"{emb_cache_path.stem}.part_{shard_idx:05d}.npy"
+            np.save(shard_path, partial)
+            shard_paths.append(shard_path)
+            all_emb_chunks = []
+            shard_idx += 1
+            print(f"[Agent3][cache save] {processed}/{total} -> {shard_path}")
 
         _cleanup_torch_cache()
 
-    final_emb = np.concatenate(all_emb_chunks, axis=0)
+    if all_emb_chunks:
+        shard_path = emb_cache_path.parent / f"{emb_cache_path.stem}.part_{shard_idx:05d}.npy"
+        np.save(shard_path, np.concatenate(all_emb_chunks, axis=0))
+        shard_paths.append(shard_path)
+        all_emb_chunks = []
+
+    if shard_paths:
+        final_emb = np.concatenate([np.load(path) for path in shard_paths], axis=0)
+    else:
+        final_emb = np.zeros((0, 0), dtype=np.float32)
     np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
+    for shard_path in shard_paths:
+        if shard_path.exists():
+            shard_path.unlink()
     return final_emb
 
 
@@ -554,10 +579,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     emb_model: SentenceTransformer | None = None
     vl_embedder: Any | None = None
+    local_image_map: Dict[str, str] | None = None
     if args.enable_multimodal_embedding:
         if Qwen3VLEmbedder is None:
             raise ImportError("Qwen3VLEmbedder not found. Please ensure qwen3_vl_embedding.py is importable.")
         print(f"[Init] load multimodal embedding model: {args.vl_embedding_model}")
+        if args.prefetch_images:
+            local_image_map = prefetch_item_images(
+                meta_map=meta_map,
+                resolve_image_fn=_resolve_item_image,
+                cache_dir=Path(args.image_cache_dir),
+                max_workers=max(1, int(args.image_prefetch_workers)),
+                timeout_sec=max(1, int(args.image_download_timeout_sec)),
+            )
         vl_embedder = Qwen3VLEmbedder(model_name_or_path=args.vl_embedding_model)
         emb_cache_path = cache_dir / "agent3_item_embedding_cache_vl.npz"
     else:
@@ -583,6 +617,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             embed_batch_size=args.embed_batch_size,
             chunk_size=args.embed_chunk_size,
             save_every_n=args.embed_save_every,
+            local_image_map=local_image_map,
         )
 
     item_emb_norm = _l2_normalize(item_emb_matrix)
@@ -656,7 +691,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
 
         if args.enable_multimodal_embedding:
-            q_emb = vl_embedder.process([{"text": q_sentence}]).detach().cpu().numpy().astype(np.float32, copy=False)
+            q_emb = vl_embedder.process([{"text": q_sentence}]).detach().to(torch.float32).cpu().numpy()
         else:
             q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
@@ -819,7 +854,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vl-embedding-model", default="Qwen/Qwen3-VL-Embedding-2B")
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
-    parser.add_argument("--embed-save-every", type=int, default=20000)
+    parser.add_argument("--embed-save-every", type=int, default=1000)
+    parser.add_argument("--prefetch-images", action="store_true", help="先集中下载图片到本地缓存，再从本地路径做多模态embedding。")
+    parser.add_argument("--image-cache-dir", default="processed/image_cache/beauty")
+    parser.add_argument("--image-prefetch-workers", type=int, default=16)
+    parser.add_argument("--image-download-timeout-sec", type=int, default=8)
     parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
     parser.add_argument("--agent3-history-embedding-topk", type=int, default=20, help="Agent3额外从用户历史中按query向量相似度召回Top-K（不足则全召回）。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
