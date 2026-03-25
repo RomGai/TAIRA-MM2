@@ -21,6 +21,14 @@ except Exception:  # pragma: no cover
     torch = None
 
 try:
+    from scripts.qwen3_vl_embedding import Qwen3VLEmbedder
+except ModuleNotFoundError:
+    try:
+        from qwen3_vl_embedding import Qwen3VLEmbedder
+    except ModuleNotFoundError:
+        Qwen3VLEmbedder = None
+
+try:
     from dynamic_reasoning_ranking_agent import run_module3
     from item_profiler_agents import (
         GlobalItemDB,
@@ -178,6 +186,36 @@ def _move_sentence_transformer_to_device(model: SentenceTransformer, device: str
         model.to(device)
 
 
+def _resolve_item_image(meta: Dict[str, Any]) -> str:
+    for key in ("imUrl", "image", "image_url", "main_image"):
+        value = str(meta.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _encode_multimodal_inputs(vl_embedder: Any, inputs: List[Dict[str, Any]], batch_size: int) -> np.ndarray:
+    all_chunks: List[np.ndarray] = []
+    start = 0
+    current_batch_size = max(1, int(batch_size))
+    while start < len(inputs):
+        end = min(len(inputs), start + current_batch_size)
+        batch_inputs = inputs[start:end]
+        try:
+            emb = vl_embedder.process(batch_inputs)
+            all_chunks.append(emb.detach().cpu().numpy().astype(np.float32, copy=False))
+            start = end
+            _cleanup_torch_cache()
+        except RuntimeError as exc:
+            if _is_oom_error(exc) and current_batch_size > 1:
+                current_batch_size = max(1, current_batch_size // 2)
+                print(f"[Agent3] OOM in multimodal embedding, retry with batch_size={current_batch_size}")
+                _cleanup_torch_cache()
+                continue
+            raise
+    return np.concatenate(all_chunks, axis=0) if all_chunks else np.zeros((0, 0), dtype=np.float32)
+
+
 def _encode_texts_with_adaptive_fallback(
     model: SentenceTransformer,
     texts: List[str],
@@ -217,7 +255,9 @@ def _encode_texts_with_adaptive_fallback(
 
 
 def _build_item_embedding_cache(
-    emb_model: SentenceTransformer,
+    emb_model: SentenceTransformer | None,
+    vl_embedder: Any | None,
+    use_multimodal_embedding: bool,
     all_item_ids: List[str],
     meta_map: Dict[str, Dict[str, Any]],
     item_sentence_cache: Dict[str, str],
@@ -235,7 +275,7 @@ def _build_item_embedding_cache(
 
     item_emb_memmap = None
     active_device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
-    if active_device == "cpu":
+    if not use_multimodal_embedding and active_device == "cpu":
         _move_sentence_transformer_to_device(emb_model, "cpu")
     processed = 0
 
@@ -249,15 +289,26 @@ def _build_item_embedding_cache(
                 item_sentence_cache[iid] = sentence
             chunk_sentences.append(sentence)
 
-        chunk_emb, used_batch_size, new_device = _encode_texts_with_adaptive_fallback(
-            emb_model,
-            chunk_sentences,
-            embed_batch_size,
-            prompt_name=None,
-            device=active_device,
-        )
-        if new_device != active_device:
-            active_device = new_device
+        if use_multimodal_embedding:
+            chunk_inputs = []
+            for idx, iid in enumerate(all_item_ids[start:end]):
+                item_input = {"text": chunk_sentences[idx]}
+                image = _resolve_item_image(meta_map[iid])
+                if image:
+                    item_input["image"] = image
+                chunk_inputs.append(item_input)
+            chunk_emb = _encode_multimodal_inputs(vl_embedder, chunk_inputs, embed_batch_size)
+            used_batch_size = embed_batch_size
+        else:
+            chunk_emb, used_batch_size, new_device = _encode_texts_with_adaptive_fallback(
+                emb_model,
+                chunk_sentences,
+                embed_batch_size,
+                prompt_name=None,
+                device=active_device,
+            )
+            if new_device != active_device:
+                active_device = new_device
 
         chunk_emb = chunk_emb.astype(np.float32, copy=False)
         if item_emb_memmap is None:
@@ -567,8 +618,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     item_sentence_cache: Dict[str, str] = text_cache.get("items", {})
     query_sentence_cache: Dict[str, str] = text_cache.get("queries", {})
 
-    print(f"[Init] load embedding model: {args.embedding_model}")
-    emb_model = SentenceTransformer(args.embedding_model)
+    emb_model: SentenceTransformer | None = None
+    vl_embedder: Any | None = None
+    if args.enable_multimodal_embedding:
+        if Qwen3VLEmbedder is None:
+            raise ImportError("Qwen3VLEmbedder not found. Please ensure qwen3_vl_embedding.py is importable.")
+        print(f"[Init] load multimodal embedding model: {args.vl_embedding_model}")
+        vl_embedder = Qwen3VLEmbedder(model_name_or_path=args.vl_embedding_model)
+        emb_cache_path = cache_dir / "agent3_item_embedding_cache_vl.npz"
+    else:
+        print(f"[Init] load embedding model: {args.embedding_model}")
+        emb_model = SentenceTransformer(args.embedding_model)
 
     item_ids_cached: List[str] = []
     item_emb_matrix: np.ndarray | None = None
@@ -580,6 +640,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if item_emb_matrix is None or item_ids_cached != all_item_ids:
         item_emb_matrix = _build_item_embedding_cache(
             emb_model=emb_model,
+            vl_embedder=vl_embedder,
+            use_multimodal_embedding=bool(args.enable_multimodal_embedding),
             all_item_ids=all_item_ids,
             meta_map=meta_map,
             item_sentence_cache=item_sentence_cache,
@@ -663,7 +725,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         filtered_idx = [item_id_to_index[iid] for iid in filtered_item_ids]
         filtered_emb = item_emb_norm[np.array(filtered_idx)]
 
-        q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
+        if args.enable_multimodal_embedding:
+            q_emb = vl_embedder.process([{"text": q_sentence}]).detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            q_emb = _encode_texts(emb_model, [q_sentence], batch_size=1, prompt_name="query").astype(np.float32, copy=False)
         q_emb_norm = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-12, None)
         sim_matrix = np.matmul(filtered_emb, q_emb_norm[0])
         rank_indices = np.argsort(-sim_matrix)
@@ -799,6 +864,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-csv", default="data/amazon_beauty/query_data1.csv")
     parser.add_argument("--filtered-meta-jsonl", default="data/amazon_beauty/meta_Beauty.filtered.jsonl")
     parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    parser.add_argument("--enable-multimodal-embedding", action="store_true", help="开启后，Agent3召回向量改为Qwen3-VL多模态embedding（文本+图片）。")
+    parser.add_argument("--vl-embedding-model", default="Qwen/Qwen3-VL-Embedding-2B")
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
