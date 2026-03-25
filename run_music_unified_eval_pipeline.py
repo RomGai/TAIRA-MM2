@@ -419,6 +419,25 @@ def _build_hybrid_recall_ids(
     return merged_ids, len(merged_ids), debug
 
 
+def _build_history_embedding_recall_ids(
+    history_item_ids: List[str],
+    item_id_to_index: Dict[str, int],
+    item_emb_norm: np.ndarray,
+    q_emb_norm: np.ndarray,
+    topk: int,
+) -> List[str]:
+    valid_history_ids = [iid for iid in history_item_ids if iid in item_id_to_index]
+    if not valid_history_ids:
+        return []
+
+    k = max(1, int(topk))
+    hist_indices = np.array([item_id_to_index[iid] for iid in valid_history_ids], dtype=np.int64)
+    hist_emb = item_emb_norm[hist_indices]
+    sim = np.matmul(hist_emb, q_emb_norm[0])
+    order = np.argsort(-sim)
+    return [valid_history_ids[int(i)] for i in order[:k]]
+
+
 def _filter_item_ids_by_categories(
     candidate_item_ids: List[str],
     meta_map: Dict[str, Dict[str, Any]],
@@ -680,6 +699,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         q_sentence = _query_sentence(query, routed["selected_category_paths"], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
+        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
 
         if args.agent3_skip_category_prefilter:
             filtered_item_ids = all_item_ids
@@ -742,6 +762,25 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             keyword_recall_topk=args.agent3_keyword_topk,
             embedding_recall_topk=args.agent3_embedding_topk,
         )
+        history_recall_ids = _build_history_embedding_recall_ids(
+            history_item_ids=history_ids,
+            item_id_to_index=item_id_to_index,
+            item_emb_norm=item_emb_norm,
+            q_emb_norm=q_emb_norm,
+            topk=args.agent3_history_embedding_topk,
+        )
+        merged_ids: List[str] = []
+        seen_merged = set()
+        for iid in top_ids + history_recall_ids:
+            if iid in seen_merged:
+                continue
+            seen_merged.add(iid)
+            merged_ids.append(iid)
+        top_ids = merged_ids
+        used_k = len(top_ids)
+        kw_debug["history_embedding_topk"] = int(args.agent3_history_embedding_topk)
+        kw_debug["history_embedding_pool_size"] = len(history_recall_ids)
+        kw_debug["merged_pool_size"] = len(top_ids)
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
@@ -786,7 +825,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[Agent1] {i}/{len(top_ids)}")
 
         history_rows: List[Dict[str, Any]] = []
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
         for i, iid in enumerate(history_ids, start=1):
             meta = meta_map.get(iid)
             if meta is None:
@@ -875,6 +913,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--agent3-keyword-topk", type=int, default=250, help="Agent3基于标题关键词匹配的Top-K召回数量。")
     parser.add_argument("--agent3-embedding-topk", type=int, default=250, help="Agent3基于向量相似度的Top-K召回数量。")
+    parser.add_argument("--agent3-history-embedding-topk", type=int, default=20, help="Agent3额外从用户历史中按query向量相似度召回Top-K（不足则全召回）。")
     parser.add_argument(
         "--agent3-skip-category-prefilter",
         action="store_true",

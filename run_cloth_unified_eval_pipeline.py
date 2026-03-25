@@ -344,6 +344,25 @@ def _build_hybrid_recall_ids(
     return merged_ids, len(merged_ids), debug
 
 
+def _build_history_embedding_recall_ids(
+    history_item_ids: List[str],
+    item_id_to_index: Dict[str, int],
+    item_emb_norm: np.ndarray,
+    q_emb_norm: np.ndarray,
+    topk: int,
+) -> List[str]:
+    valid_history_ids = [iid for iid in history_item_ids if iid in item_id_to_index]
+    if not valid_history_ids:
+        return []
+
+    k = max(1, int(topk))
+    hist_indices = np.array([item_id_to_index[iid] for iid in valid_history_ids], dtype=np.int64)
+    hist_emb = item_emb_norm[hist_indices]
+    sim = np.matmul(hist_emb, q_emb_norm[0])
+    order = np.argsort(-sim)
+    return [valid_history_ids[int(i)] for i in order[:k]]
+
+
 
 def _recall_at_k(labels: List[int], k: int) -> float:
     if not labels:
@@ -573,6 +592,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
         q_sentence = _query_sentence(query, routed.get("selected_category_paths", []) or [], routed["rewritten_query"])
         query_sentence_cache[f"{user_id}::{q_sentence}"] = q_sentence
+        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
 
         filtered_item_ids = all_item_ids
         print(f"[Agent3][categories] skip exact-match prefilter; candidate_count={len(filtered_item_ids)}")
@@ -597,6 +617,25 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             keyword_recall_topk=args.keyword_recall_topk or args.fixed_recall_topk,
             embedding_recall_topk=args.embedding_recall_topk or args.fixed_recall_topk,
         )
+        history_recall_ids = _build_history_embedding_recall_ids(
+            history_item_ids=history_ids,
+            item_id_to_index=item_id_to_index,
+            item_emb_norm=item_emb_norm,
+            q_emb_norm=q_emb_norm,
+            topk=args.agent3_history_embedding_topk,
+        )
+        merged_ids: List[str] = []
+        seen_merged = set()
+        for iid in top_ids + history_recall_ids:
+            if iid in seen_merged:
+                continue
+            seen_merged.add(iid)
+            merged_ids.append(iid)
+        top_ids = merged_ids
+        used_k = len(top_ids)
+        kw_debug["history_embedding_topk"] = int(args.agent3_history_embedding_topk)
+        kw_debug["history_embedding_pool_size"] = len(history_recall_ids)
+        kw_debug["merged_pool_size"] = len(top_ids)
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
@@ -641,7 +680,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[Agent1] {i}/{len(top_ids)}")
 
         history_rows: List[Dict[str, Any]] = []
-        history_ids = [x for x in str(row.get("remaining_interaction_string", "")).split("|") if x]
         for i, iid in enumerate(history_ids, start=1):
             meta = meta_map.get(iid)
             if meta is None:
@@ -731,6 +769,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixed-recall-topk", type=int, default=250, help="兼容旧参数：当未单独指定关键词/embedding召回Top-K时，作为二者的共同默认值。")
     parser.add_argument("--keyword-recall-topk", type=int, default=0, help="Agent3基于标题关键词匹配的召回Top-K；<=0时回退到--fixed-recall-topk。")
     parser.add_argument("--embedding-recall-topk", type=int, default=0, help="Agent3基于embedding相似度的召回Top-K；<=0时回退到--fixed-recall-topk。")
+    parser.add_argument("--agent3-history-embedding-topk", type=int, default=20, help="Agent3额外从用户历史中按query向量相似度召回Top-K（不足则全召回）。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")
